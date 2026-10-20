@@ -13,7 +13,6 @@ from typing import Any
 from unittest.mock import MagicMock, _patch, patch
 
 from aiohttp import AsyncResolver
-from awesomeversion import AwesomeVersion
 import freezegun
 from homeassistant import loader, runner
 from homeassistant.auth.models import Credentials
@@ -21,7 +20,6 @@ from homeassistant.auth.providers.homeassistant import HassAuthProvider
 from homeassistant.components.lovelace.const import DOMAIN as LOVELACE_DOMAIN
 from homeassistant.components.lovelace.resources import ResourceStorageCollection
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
@@ -42,11 +40,16 @@ from custom_components.hacs.repositories import (
     HacsThemeRepository,
 )
 from custom_components.hacs.utils.store import async_load_from_store
+from custom_components.hacs.validate.license import (
+    SPDX_LICENSE_LIST_COMMIT,
+    SPDX_LICENSE_LIST_URL,
+)
 
 from tests import _async_suggest_report_issue_mock_call_tracker
 from tests.common import (
     IGNORED_BASE_FILES,
     REQUEST_CONTEXT,
+    MockedResponse,
     MockOwner,
     ProxyClientSession,
     ResponseMocker,
@@ -54,6 +57,7 @@ from tests.common import (
     client_session_proxy,
     create_config_entry,
     dummy_repository_base,
+    fixture,
     get_hacs,
     mock_storage as mock_storage,
     recursive_remove_key,
@@ -62,9 +66,6 @@ from tests.common import (
 )
 from tests.homeassistantfixtures.dev import (
     async_test_home_assistant as async_test_home_assistant_dev,
-)
-from tests.homeassistantfixtures.min import (
-    async_test_home_assistant as async_test_home_assistant_min_version,
 )
 
 # Set default logger
@@ -123,20 +124,17 @@ def hass_storage():
 @pytest_asyncio.fixture(autouse=True)
 async def mock_zeroconf_resolver() -> Generator[_patch]:
     """Mock out the zeroconf resolver."""
-    if AwesomeVersion(HA_VERSION) < "2025.2.0dev0":
-        yield None
-    else:
-        resolver = AsyncResolver(asyncio.get_running_loop())
-        resolver.real_close = resolver.close
-        patcher = patch(
-            "homeassistant.helpers.aiohttp_client._async_make_resolver",
-            return_value=resolver,
-        )
-        patcher.start()
-        try:
-            yield patcher
-        finally:
-            patcher.stop()
+    resolver = AsyncResolver(asyncio.get_running_loop())
+    resolver.real_close = resolver.close
+    patcher = patch(
+        "homeassistant.helpers.aiohttp_client._async_make_resolver",
+        return_value=resolver,
+    )
+    patcher.start()
+    try:
+        yield patcher
+    finally:
+        patcher.stop()
 
 
 @pytest.fixture
@@ -158,14 +156,7 @@ async def hass(time_freezer, tmpdir, check_report_issue: None):
         orig_exception_handler(loop, context)
 
     exceptions: list[Exception] = []
-    if AwesomeVersion(HA_VERSION) > "2025.3.0":
-        context_manager = async_test_home_assistant_dev(
-            loop, config_dir=tmpdir.strpath)
-    else:
-        context_manager = async_test_home_assistant_min_version(
-            loop, config_dir=tmpdir.strpath,
-        )
-    async with context_manager as hass:
+    async with async_test_home_assistant_dev(loop, config_dir=tmpdir.strpath) as hass:
         await async_setup_component(hass, "homeassistant", {})
         with patch("homeassistant.components.python_script.setup", return_value=True):
             assert await async_setup_component(hass, "python_script", {})
@@ -338,6 +329,8 @@ def snapshots(snapshot: Snapshot) -> SnapshotFixture:
                                             "modified_at",
                                             # This can be re-enabled again when min version is > 2026.2
                                             "original_name",
+                                            # Added in 2026.10, unknown to the min version
+                                            "next_name_part",
                                         ),
                                     ),
                                 }
@@ -368,6 +361,8 @@ async def proxy_session(hass: HomeAssistant) -> Generator:
     with patch(
         "homeassistant.helpers.aiohttp_client.async_get_clientsession", return_value=mock_session,
     ), patch("scripts.data.generate_category_data.ClientSession", ProxyClientSession), patch(
+        "scripts.data.merge_category_data.ClientSession", ProxyClientSession,
+    ), patch(
         "aiohttp.ClientSession", ProxyClientSession,
     ):
         yield
@@ -403,6 +398,15 @@ def response_mocker() -> ResponseMocker:
     mocker = ResponseMocker()
     yield mocker
     mocker.responses.clear()
+
+
+@pytest.fixture(autouse=True)
+def mock_spdx_license_list(response_mocker: ResponseMocker) -> None:
+    """Mock the SPDX license list independent of the pinned commit."""
+    response_mocker.add(
+        SPDX_LICENSE_LIST_URL,
+        MockedResponse(content=fixture("spdx_license_list.json", asjson=False), keep=True),
+    )
 
 
 @pytest_asyncio.fixture()
@@ -468,7 +472,8 @@ def track_api_usage(snapshots: SnapshotFixture):
                 )
             else:
                 calls[_test_caller] = {}
-        if (url := call.get("url")) not in calls[_test_caller]:
+        url = call.get("url").replace(SPDX_LICENSE_LIST_COMMIT, "SPDX_LICENSE_LIST_COMMIT")
+        if url not in calls[_test_caller]:
             calls[_test_caller][url] = 0
         calls[_test_caller][url] += 1
 

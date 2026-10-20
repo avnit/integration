@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import json
 import logging
+import math
 import os
 import sys
 from typing import Any, Literal
+import zlib
 
 from aiogithubapi import (
     GitHub,
@@ -27,7 +30,10 @@ from custom_components.hacs.base import HacsBase, HacsRepositories
 from custom_components.hacs.const import HACS_ACTION_GITHUB_API_HEADERS
 from custom_components.hacs.data_client import HacsDataClient
 from custom_components.hacs.enums import HacsGitHubRepo
-from custom_components.hacs.exceptions import HacsExecutionStillInProgress
+from custom_components.hacs.exceptions import (
+    HacsException,
+    HacsExecutionStillInProgress,
+)
 from custom_components.hacs.repositories.base import (
     HACS_MANIFEST_KEYS_TO_EXPORT,
     REPOSITORY_KEYS_TO_EXPORT,
@@ -36,9 +42,13 @@ from custom_components.hacs.repositories.base import (
 from custom_components.hacs.utils.data import HacsData
 from custom_components.hacs.utils.decode import decode_content
 from custom_components.hacs.utils.decorator import concurrent
+from custom_components.hacs.utils.filters import get_first_directory_in_directory
 from custom_components.hacs.utils.json import json_loads
 from custom_components.hacs.utils.queue_manager import QueueManager
-from custom_components.hacs.utils.validate import VALIDATE_GENERATED_V2_REPO_DATA
+from custom_components.hacs.utils.validate import (
+    VALIDATE_GENERATED_V2_REPO_DATA,
+    filter_integration_categories,
+)
 
 from .common import expand_and_humanize_error, print_error_and_exit
 
@@ -56,7 +66,104 @@ stream_handler.setFormatter(logging.Formatter("%(levelname)s%(message)s"))
 log_handler.addHandler(stream_handler)
 
 OUTPUT_DIR = os.path.join(os.getcwd(), "outputdata")
+SHARDS_DIR = os.path.join(OUTPUT_DIR, "_shards")
 COMPARE_IGNORE = {"etag_releases", "etag_repository", "last_fetched"}
+
+# Directory with the published data and hacs/default lists fetched by the
+# fetch-stored-data job.
+# When set, it is read instead of fetching; unset outside the generate workflow.
+STORED_DATA_DIR = os.getenv("HACS_STORED_DATA_DIR")
+
+UPDATE_REPOSITORY_CONCURRENT_TASKS = int(
+    os.getenv("HACS_DATA_GENERATOR_UPDATE_REPOSITORY_CONCURRENT_TASKS", "2")
+)
+if UPDATE_REPOSITORY_CONCURRENT_TASKS < 1:
+    raise ValueError(
+        "HACS_DATA_GENERATOR_UPDATE_REPOSITORY_CONCURRENT_TASKS must be a positive integer"
+    )
+UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS = float(
+    os.getenv("HACS_DATA_GENERATOR_UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS", "1")
+)
+if not 0 <= UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS < math.inf:
+    raise ValueError(
+        "HACS_DATA_GENERATOR_UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS must be a non-negative number"
+    )
+REPOSITORY_REFRESH_INTERVAL_DAYS = float(
+    os.getenv("HACS_DATA_GENERATOR_REPOSITORY_REFRESH_INTERVAL_DAYS", "7")
+)
+if not 0 <= REPOSITORY_REFRESH_INTERVAL_DAYS < math.inf:
+    raise ValueError(
+        "HACS_DATA_GENERATOR_REPOSITORY_REFRESH_INTERVAL_DAYS must be a non-negative number"
+    )
+REPOSITORY_REFRESH_INTERVAL = timedelta(days=REPOSITORY_REFRESH_INTERVAL_DAYS)
+
+
+def _read_snapshot[T](
+    hacs: AdjustedHacs,
+    filename: str,
+    expected_type: type[T],
+) -> T | None:
+    """Read a snapshot file from ``STORED_DATA_DIR``.
+
+    Returns the parsed JSON when available, or ``None`` (so the caller fetches
+    instead) when the dir is unset, the file is missing or unreadable, or the
+    content is not of ``expected_type``.
+    """
+    if not STORED_DATA_DIR:
+        return None
+    try:
+        with open(os.path.join(STORED_DATA_DIR, filename), encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        hacs.log.warning("Could not read snapshot %s (%s), fetching instead", filename, err)
+        return None
+    if not isinstance(data, expected_type):
+        hacs.log.warning(
+            "Snapshot %s has unexpected type %s, fetching instead",
+            filename,
+            type(data).__name__,
+        )
+        return None
+    return data
+
+
+async def get_stored_data(hacs: AdjustedHacs, category: str) -> dict[str, dict[str, Any]]:
+    """Return existing category data from the snapshot dir when available, else fetch."""
+    if (data := _read_snapshot(hacs, f"{category}.json", dict)) is not None:
+        return data
+    return await hacs.data_client.get_data(category, validate=False)
+
+
+async def get_removed_repositories(hacs: AdjustedHacs) -> list[str]:
+    """Return the removed-repositories list from the snapshot dir when available, else fetch."""
+    if (removed := _read_snapshot(hacs, "removed.json", list)) is not None:
+        return removed
+    return await hacs.data_client.get_repositories("removed")
+
+
+async def get_default_repositories(hacs: AdjustedHacs, category: str) -> list[str]:
+    """Return the hacs/default list of a category from the snapshot dir when available, else fetch."""
+    if (repositories := _read_snapshot(hacs, f"default-{category}.json", list)) is not None:
+        return repositories
+    return await hacs.async_github_get_hacs_default_file(category)
+
+
+def shard_for(full_name: str, shards: int) -> int:
+    """Return the 0-based shard of a repository, stable across processes."""
+    if shards <= 1:
+        return 0
+    return zlib.crc32(full_name.lower().encode()) % shards
+
+
+def _slice_by_shard(
+    data: dict[str, dict[str, Any]], index: int, shards: int
+) -> dict[str, dict[str, Any]]:
+    """Return the entries of data that belong to the given shard."""
+    if shards <= 1:
+        return data
+    return {
+        key: value for key, value in data.items() if shard_for(value["full_name"], shards) == index
+    }
 
 
 def jsonprint(data: any):
@@ -125,6 +232,12 @@ class AdjustedHacsData(HacsData):
                 )
                 continue
             self.async_restore_repository(entry, repo_data)
+            # Keeps the categories when the repository is not modified
+            if (categories := repo_data.get("categories")) and (
+                repository := self.hacs.repositories.get_by_full_name(repo_data["full_name"])
+                or self.hacs.repositories.get_by_id(entry)
+            ):
+                repository.integration_manifest = {"categories": categories}
 
     @callback
     def async_store_repository_data(self, repository: HacsRepository) -> dict:
@@ -138,10 +251,15 @@ class AdjustedHacsData(HacsData):
             if (value := getattr(repository.data, key, default)) != default:
                 data[key] = value
 
+        if categories := filter_integration_categories(
+            repository.integration_manifest.get("categories")
+        ):
+            data["categories"] = categories
+
         data["last_fetched"] = (
             repository.data.last_fetched.timestamp()
             if repository.data.last_fetched
-            else datetime.utcnow().timestamp()
+            else datetime.now(UTC).timestamp()
         )
 
         if not repository_has_missing_keys(repository, "store"):
@@ -195,13 +313,26 @@ class AdjustedHacs(HacsBase):
             repository_full_name=repository_full_name, category=category, default=True
         )
 
-    @concurrent(concurrenttasks=2, backoff_time=1)
+    @concurrent(
+        concurrenttasks=UPDATE_REPOSITORY_CONCURRENT_TASKS,
+        backoff_time=UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS,
+    )
     async def concurrent_update_repository(self, repository: HacsRepository) -> None:
+        """Update a repository, and fetch it again on the next run if the update fails."""
+        try:
+            await self.async_update_repository(repository)
+        except Exception:
+            # The queue only logs the error, an empty ETag makes the next run fetch it again
+            repository.data.etag_repository = ""
+            raise
+
+    async def async_update_repository(self, repository: HacsRepository) -> None:
         """Update a repository."""
         if repository_has_missing_keys(repository, "update"):
             # If we have missing keys, force a full update by setting the etag to None
             repository.data.etag_repository = None
 
+        previous_prerelease = repository.data.prerelease
         if repository.data.last_version not in (None, ""):
             releases: list[GitHubReleaseModel] = []
             try:
@@ -278,6 +409,10 @@ class AdjustedHacs(HacsBase):
                 ):
                     repository.data.prerelease = None
 
+                # Clients only apply data with a newer last_fetched, which needs an update
+                if repository.data.prerelease != previous_prerelease:
+                    repository.data.etag_repository = None
+
             except GitHubNotModifiedException:
                 repository.data.releases = True
                 repository.logger.info(
@@ -291,10 +426,77 @@ class AdjustedHacs(HacsBase):
                 repository.data.releases = False
                 repository.logger.error("%s %s", repository.string, exception)
 
-        await repository.common_update(
+        # A new release or prerelease, missing keys or a failed run clear the ETag
+        if (
+            repository.data.releases
+            and repository.data.last_version
+            and repository.data.etag_repository
+            and repository.data.last_fetched
+        ):
+            age = datetime.now(UTC) - repository.data.last_fetched
+            if age < REPOSITORY_REFRESH_INTERVAL:
+                remaining = int((REPOSITORY_REFRESH_INTERVAL - age).total_seconds())
+                days, remaining = divmod(remaining, 86400)
+                hours, remaining = divmod(remaining, 3600)
+                minutes, seconds = divmod(remaining, 60)
+                repository.logger.info(
+                    "%s Current release %s is the latest one, next refresh in %02d:%02d:%02d:%02d",
+                    repository.string,
+                    repository.data.last_version,
+                    days,
+                    hours,
+                    minutes,
+                    seconds,
+                )
+                return
+            # A 304 doesn't update last_fetched, so the refresh has to fetch the repository
+            repository.data.etag_repository = None
+
+        previous_etag = repository.data.etag_repository
+        updated = await repository.common_update(
             force=repository.data.etag_repository is None,
             skip_releases=repository.data.releases,
         )
+
+        if repository.data.etag_repository is None:
+            raise HacsException(f"{repository.string} Could not update the repository")
+
+        if repository.data.etag_repository == previous_etag:
+            # Not modified
+            return
+
+        if not updated or not repository.tree:
+            raise HacsException(f"{repository.string} Could not update the repository")
+
+        if repository.data.category != "integration":
+            return
+
+        # common_update does not set the integration path or reload manifest.json
+        if repository.repository_manifest.content_in_root:
+            repository.content.path.remote = ""
+        elif repository.content.path.remote == "custom_components":
+            if not (name := get_first_directory_in_directory(repository.tree, "custom_components")):
+                # The layout is unknown, like when hacs.json failed to download
+                raise HacsException(f"{repository.string} Could not find the integration directory")
+            repository.content.path.remote = f"custom_components/{name}"
+
+        await self.async_update_integration_manifest(repository, repository.ref)
+
+    async def async_update_integration_manifest(
+        self, repository: HacsRepository, version: str
+    ) -> None:
+        """Replace the integration manifest with the one for version."""
+        try:
+            manifest = await repository.get_integration_manifest(version=version)
+        except HacsException:
+            # The tree has no manifest.json at the integration path
+            manifest = {}
+
+        if manifest is None:
+            raise HacsException(f"{repository.string} Could not download manifest.json")
+
+        # An invalid manifest has no categories
+        repository.integration_manifest = manifest if isinstance(manifest, dict) else {}
 
     async def generate_data_for_category(
         self,
@@ -302,20 +504,18 @@ class AdjustedHacs(HacsBase):
         repository_name: str | None,
         current_data: dict[str, dict[str, Any]],
         force: bool,
+        index: int = 0,
+        shards: int = 1,
     ) -> dict[str, dict[str, Any]]:
-        """Generate data for category."""
-        removed = (
-            []
-            if repository_name is not None
-            else await self.data_client.get_repositories("removed")
-        )
+        """Generate data for category, limited to one shard when shards > 1."""
+        removed = [] if repository_name is not None else await get_removed_repositories(self)
         await self.data.register_base_data(
             category,
-            {} if force else current_data,
+            {} if force else _slice_by_shard(current_data, index, shards),
             removed,
         )
         self.queue.clear()
-        await self.get_category_repositories(category, repository_name, removed)
+        await self.get_category_repositories(category, repository_name, removed, index, shards)
 
         async def _handle_queue():
             if not self.queue.pending_tasks:
@@ -355,12 +555,12 @@ class AdjustedHacs(HacsBase):
         category: str,
         repository_name: str | None,
         removed: list[str],
+        index: int = 0,
+        shards: int = 1,
     ) -> None:
         """Get repositories from category."""
         repositories = (
-            await self.async_github_get_hacs_default_file(category)
-            if repository_name is None
-            else []
+            await get_default_repositories(self, category) if repository_name is None else []
         )
 
         if repository_name is not None:
@@ -368,6 +568,9 @@ class AdjustedHacs(HacsBase):
         elif category == "integration":
             # hacs/integration i not in the default file, but it's still needed
             repositories.append("hacs/integration")
+
+        if shards > 1:
+            repositories = [repo for repo in repositories if shard_for(repo, shards) == index]
 
         for repo in repositories:
             if repo in removed:
@@ -392,6 +595,8 @@ class AdjustedHacs(HacsBase):
     ) -> dict[str, Any]:
         """Summarize data."""
         changed = 0
+        refreshed = 0
+        expired = datetime.now(UTC).timestamp() - REPOSITORY_REFRESH_INTERVAL.total_seconds()
 
         current_count = len(current_data.keys())
         new_count = len(updated_data.keys())
@@ -403,6 +608,14 @@ class AdjustedHacs(HacsBase):
                 ignore=COMPARE_IGNORE,
             ):
                 changed += 1
+            # Unpublished, these make the next run refresh again or skip a failed repository
+            if (previous := current_data.get(repo_id)) is not None and (
+                previous.get("last_fetched") is None
+                or previous["last_fetched"] <= expired < repo_data.get("last_fetched", 0)
+                or (previous.get("etag_repository") == "")
+                != (repo_data.get("etag_repository") == "")
+            ):
+                refreshed += 1
 
         async def _rate_limit() -> dict[str, Any]:
             res = await self.async_github_api_method(
@@ -422,12 +635,13 @@ class AdjustedHacs(HacsBase):
             }
 
         summary = {
-            "changed_pct": round((changed / new_count) * 100),
+            "changed_pct": round((changed / new_count) * 100) if new_count else 0,
             "changed": changed,
             "current_count": current_count,
             "diff": abs(new_count - current_count),
             "new_count": new_count,
             "rate_limit": await _rate_limit(),
+            "refreshed": refreshed,
         }
 
         jsonprint(summary)
@@ -450,14 +664,140 @@ class AdjustedHacs(HacsBase):
         return json_loads(decode_content(response.data.content))
 
 
-async def generate_category_data(category: str, repository_name: str = None):
-    """Generate data."""
+def _dump_diff(entries: dict[str, dict[str, Any]], data_file) -> None:
+    """Write a diff-friendly (COMPARE_IGNORE stripped) JSON dump."""
+    json.dump(
+        {i: {k: v for k, v in d.items() if k not in COMPARE_IGNORE} for i, d in entries.items()},
+        data_file,
+        cls=JSONEncoder,
+        sort_keys=True,
+        indent=2,
+    )
+
+
+async def finalize_category_output(
+    hacs: AdjustedHacs,
+    category: str,
+    stored_data: dict[str, dict[str, Any]],
+    current_data: dict[str, dict[str, Any]],
+    updated_data: dict[str, dict[str, Any]],
+) -> None:
+    """Summarize, validate and write the final per-category output files."""
+    os.makedirs(os.path.join(OUTPUT_DIR, category), exist_ok=True)
+    os.makedirs(os.path.join(OUTPUT_DIR, "diff"), exist_ok=True)
+
+    summary = await hacs.summarize_data(current_data, updated_data)
+    with open(
+        os.path.join(OUTPUT_DIR, "summary.json"),
+        mode="w",
+        encoding="utf-8",
+    ) as data_file:
+        json.dump(
+            summary,
+            data_file,
+            cls=JSONEncoder,
+            sort_keys=True,
+            indent=2,
+        )
+
+    did_raise = False
+    if not updated_data or len(updated_data) == 0 or not isinstance(updated_data, dict):
+        print_error_and_exit("Updated data is empty", category)
+        did_raise = True
+
+    try:
+        VALIDATE_GENERATED_V2_REPO_DATA[category](updated_data)
+    except vol.Invalid as error:
+        did_raise = True
+        errors = expand_and_humanize_error(updated_data, error)
+        if isinstance(errors, list):
+            for err in errors:
+                print(f"::error::{err}")
+            sys.exit(1)
+
+        print_error_and_exit(f"Invalid data: {errors}", category)
+
+    if did_raise:
+        print_error_and_exit("Validation did raise but did not exit!", category)
+        sys.exit(1)  # Fallback, should not be reached
+
+    with open(
+        os.path.join(OUTPUT_DIR, category, "stored.json"),
+        mode="w",
+        encoding="utf-8",
+    ) as data_file:
+        json.dump(
+            stored_data,
+            data_file,
+            cls=JSONEncoder,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    with open(
+        os.path.join(OUTPUT_DIR, category, "data.json"),
+        mode="w",
+        encoding="utf-8",
+    ) as data_file:
+        json.dump(
+            updated_data,
+            data_file,
+            cls=JSONEncoder,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    with open(
+        os.path.join(OUTPUT_DIR, category, "repositories.json"),
+        mode="w",
+        encoding="utf-8",
+    ) as repositories_file:
+        json.dump(
+            sorted(v["full_name"] for v in updated_data.values()),
+            repositories_file,
+            separators=(",", ":"),
+        )
+
+    with open(
+        os.path.join(OUTPUT_DIR, "diff", f"{category}_before.json"),
+        mode="w",
+        encoding="utf-8",
+    ) as data_file:
+        _dump_diff(current_data, data_file)
+
+    with open(
+        os.path.join(OUTPUT_DIR, "diff", f"{category}_after.json"),
+        mode="w",
+        encoding="utf-8",
+    ) as data_file:
+        _dump_diff(updated_data, data_file)
+
+
+def write_shard_output(
+    category: str,
+    shard_number: int,
+    updated_data: dict[str, dict[str, Any]],
+) -> None:
+    """Write the partial data of one shard for a later merge step."""
+    shard_dir = os.path.join(SHARDS_DIR, category, str(shard_number))
+    os.makedirs(shard_dir, exist_ok=True)
+    with open(os.path.join(shard_dir, "data.json"), mode="w", encoding="utf-8") as data_file:
+        json.dump(updated_data, data_file, cls=JSONEncoder, separators=(",", ":"))
+
+
+async def generate_category_data(
+    category: str,
+    repository_name: str = None,
+    shard: tuple[int, int] | None = None,
+):
+    """Generate data, or only the 1-based shard (x, y) when shard is given."""
+    shard_number, shards = shard or (1, 1)
     async with ClientSession() as session:
         hacs = AdjustedHacs(session=session, token=os.getenv("DATA_GENERATOR_TOKEN"))
+        # Create the output directories up front (idempotent) so the side
+        # effects are present even if data generation fails before finalization.
         os.makedirs(os.path.join(OUTPUT_DIR, category), exist_ok=True)
         os.makedirs(os.path.join(OUTPUT_DIR, "diff"), exist_ok=True)
         force = os.environ.get("FORCE_REPOSITORY_UPDATE") == "True"
-        stored_data = await hacs.data_client.get_data(category, validate=False)
+        stored_data = await get_stored_data(hacs, category)
         current_data = (
             next(
                 (
@@ -476,114 +816,48 @@ async def generate_category_data(category: str, repository_name: str = None):
             repository_name,
             current_data,
             force=force,
+            index=shard_number - 1,
+            shards=shards,
         )
 
-        summary = await hacs.summarize_data(current_data, updated_data)
-        with open(
-            os.path.join(OUTPUT_DIR, "summary.json"),
-            mode="w",
-            encoding="utf-8",
-        ) as data_file:
-            json.dump(
-                summary,
-                data_file,
-                cls=JSONEncoder,
-                sort_keys=True,
-                indent=2,
-            )
+        if shard is not None:
+            write_shard_output(category, shard_number, updated_data)
+            return
 
-        did_raise = False
-        if not updated_data or len(updated_data) == 0 or not isinstance(updated_data, dict):
-            print_error_and_exit("Updated data is empty", category)
-            did_raise = True
+        await finalize_category_output(
+            hacs,
+            category,
+            stored_data,
+            current_data,
+            updated_data,
+        )
 
-        try:
-            VALIDATE_GENERATED_V2_REPO_DATA[category](updated_data)
-        except vol.Invalid as error:
-            did_raise = True
-            errors = expand_and_humanize_error(updated_data, error)
-            if isinstance(errors, list):
-                for err in errors:
-                    print(f"::error::{err}")
-                sys.exit(1)
 
-            print_error_and_exit(f"Invalid data: {errors}", category)
-
-        if did_raise:
-            print_error_and_exit("Validation did raise but did not exit!", category)
-            sys.exit(1)  # Fallback, should not be reached
-
-        with open(
-            os.path.join(OUTPUT_DIR, category, "stored.json"),
-            mode="w",
-            encoding="utf-8",
-        ) as data_file:
-            json.dump(
-                stored_data,
-                data_file,
-                cls=JSONEncoder,
-                separators=(",", ":"),
-            )
-        with open(
-            os.path.join(OUTPUT_DIR, category, "data.json"),
-            mode="w",
-            encoding="utf-8",
-        ) as data_file:
-            json.dump(
-                updated_data,
-                data_file,
-                cls=JSONEncoder,
-                separators=(",", ":"),
-            )
-        with open(
-            os.path.join(OUTPUT_DIR, category, "repositories.json"),
-            mode="w",
-            encoding="utf-8",
-        ) as repositories_file:
-            json.dump(
-                [v["full_name"] for v in updated_data.values()],
-                repositories_file,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-
-        with open(
-            os.path.join(OUTPUT_DIR, "diff", f"{category}_before.json"),
-            mode="w",
-            encoding="utf-8",
-        ) as data_file:
-            json.dump(
-                {
-                    i: {k: v for k, v in d.items() if k not in COMPARE_IGNORE}
-                    for i, d in current_data.items()
-                },
-                data_file,
-                cls=JSONEncoder,
-                sort_keys=True,
-                indent=2,
-            )
-
-        with open(
-            os.path.join(OUTPUT_DIR, "diff", f"{category}_after.json"),
-            mode="w",
-            encoding="utf-8",
-        ) as data_file:
-            json.dump(
-                {
-                    i: {k: v for k, v in d.items() if k not in COMPARE_IGNORE}
-                    for i, d in updated_data.items()
-                },
-                data_file,
-                cls=JSONEncoder,
-                sort_keys=True,
-                indent=2,
-            )
+def _parse_shard(value: str) -> tuple[int, int]:
+    """Parse a 1-based "x/y" shard argument."""
+    try:
+        number, total = (int(part) for part in value.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid shard {value!r}, expected x/y") from None
+    if not 1 <= number <= total:
+        raise argparse.ArgumentTypeError(f"invalid shard {value!r}, expected 1 <= x <= y")
+    return number, total
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate HACS compliant data.")
+    parser.add_argument("category")
+    parser.add_argument("repository_name", nargs="?", default=None)
+    parser.add_argument(
+        "--shard",
+        type=_parse_shard,
+        help="generate only shard x of y (1-based), for example 1/3",
+    )
+    args = parser.parse_args()
     asyncio.run(
         generate_category_data(
-            sys.argv[1],  # category
-            sys.argv[2] if len(sys.argv) > 2 else None,  # repository_name
+            args.category,
+            args.repository_name,
+            shard=args.shard,
         )
     )

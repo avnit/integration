@@ -19,7 +19,7 @@ permissions: {}
 jobs:
   preflight:
     if: ${{ github.repository == 'hacs/integration' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: Preflight
     steps:
       - name: Validation preflight
@@ -40,7 +40,7 @@ jobs:
   validate-hassfest:
     needs:
       - "preflight"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: With hassfest
     steps:
       - name: Checkout the repository
@@ -52,13 +52,17 @@ jobs:
       - name: Remove tests
         run: rm -rf tests
 
+      # Since 2026.10, hassfest rejects aiogithubapi in the manifest because Home Assistant
+      # itself depends on it. The min supported version doesn't, so it has to stay listed.
       - name: Hassfest validation
-        uses: home-assistant/actions/hassfest@e3fb68ebda13d88a0d695082f471ba2c83d025fb # master
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}:/github/workspace" \
+            ghcr.io/home-assistant/hassfest:2026.9.4@sha256:cf7088cd0eaf291024165629853a1853f1a9fc2652b74141c5ed133499738760
 
   validate-hacs:
     needs:
       - "preflight"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: With HACS Action
     steps:
       - name: HACS validation
@@ -70,7 +74,7 @@ jobs:
     if: ${{ github.event_name != 'schedule' }}
     needs:
       - "preflight"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: Check ${{matrix.entry.category}} ${{matrix.entry.repository}} with HACS Action (local)
     strategy:
       matrix:
@@ -101,7 +105,7 @@ jobs:
     if: ${{ github.event_name != 'schedule' }}
     needs:
       - "preflight"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: Check ${{matrix.entry.category}} ${{matrix.entry.repository}} with HACS data generation
     strategy:
       matrix:
@@ -119,7 +123,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14"
+          python-version-file: .python-version
           cache: 'pip'
           cache-dependency-path: |
             requirements_base.txt
@@ -127,7 +131,6 @@ jobs:
 
       - name: Install dependencies
         run:  |
-          scripts/install/frontend
           scripts/install/pip_packages --requirement requirements_generate_data.txt
 
       - name: Generate data
@@ -165,7 +168,7 @@ jobs:
           python3 -m scripts.data.validate_category_data ${{  matrix.entry.category }} outputdata/${{ matrix.entry.category }}/data.json
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: "${{ matrix.entry.category }}_${{ strategy.job-index }}"
           path: |
@@ -177,7 +180,7 @@ jobs:
 
 
   notify_on_failure:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: Trigger Discord notification when jobs fail
     needs: ["preflight","validate-hassfest", "validate-hacs"]
     steps:
